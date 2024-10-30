@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	logcollect "diagnostic-agent/internal/log" // aliased to avoid conflict
+	logcollect "diagnostic-agent/internal/log"
 	"diagnostic-agent/internal/network"
 	"diagnostic-agent/internal/tunnel"
 )
@@ -31,21 +31,25 @@ type Message struct {
 	Payload interface{} `json:"payload"`
 }
 
+type LogSearchCommand struct {
+	Files    []string `json:"files"`
+	Keywords []string `json:"keywords"`
+}
+
 type Agent struct {
 	networkCollector *network.Collector
 	logCollector     *logcollect.Collector
 	tunnel           *tunnel.Tunnel
 	redisAddr        string
+	activeSearches   sync.WaitGroup
 }
 
 func New(hostAddr, redisAddr string) (*Agent, error) {
-	// Initialize network metrics collector
 	networkCollector, err := network.New(redisAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create network collector: %w", err)
 	}
 
-	// Initialize log collector
 	logCollector, err := logcollect.New(redisAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create log collector: %w", err)
@@ -62,40 +66,32 @@ func New(hostAddr, redisAddr string) (*Agent, error) {
 func (a *Agent) Run(ctx context.Context) error {
 	log.Println("Starting agent...")
 
-	// Connect tunnel
 	if err := a.tunnel.Connect(ctx); err != nil {
 		return fmt.Errorf("failed to connect tunnel: %w", err)
 	}
 	defer a.tunnel.Close()
 
-	// Start collectors
 	log.Println("Starting collectors...")
-	go a.networkCollector.Start(ctx)
 	go a.logCollector.Start(ctx)
 
-	// Create a WaitGroup for our goroutines
 	var wg sync.WaitGroup
-	wg.Add(3) // Commands, Network Metrics, Logs
+	wg.Add(3)
 
-	// Handle incoming commands
 	go func() {
 		defer wg.Done()
 		a.handleCommands(ctx)
 	}()
 
-	// Handle network metrics
 	go func() {
 		defer wg.Done()
 		a.handleNetworkMetrics(ctx)
 	}()
 
-	// Handle logs
 	go func() {
 		defer wg.Done()
 		a.handleLogs(ctx)
 	}()
 
-	// Wait for all goroutines to finish
 	wg.Wait()
 	return nil
 }
@@ -115,26 +111,72 @@ func (a *Agent) handleCommands(ctx context.Context) {
 				continue
 			}
 
-			// Set a reasonable timeout for command reading
+			// Set read deadline
 			if conn := a.tunnel.GetConnection(); conn != nil {
 				conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			}
 
+			// Read and parse the message
 			var msg Message
 			if err := decoder.Decode(&msg); err != nil {
 				if err == io.EOF || strings.Contains(err.Error(), "i/o timeout") {
-					// These are expected, no need to log them
 					continue
 				}
-				log.Printf("[AGENT][ERROR] Failed to decode command: %v", err)
-				time.Sleep(time.Second)
+				log.Printf("[AGENT][ERROR] Failed to decode message: %v", err)
+
+				// Try to read the raw data for debugging
+				rawData := make([]byte, 1024)
+				if n, _ := decoder.Buffered().Read(rawData); n > 0 {
+					log.Printf("[AGENT][DEBUG] Raw data received: %s", string(rawData[:n]))
+				}
 				continue
 			}
 
-			log.Printf("[AGENT] Received command: %s", msg.Type)
-			// Process command...
+			log.Printf("[AGENT] Received command type: %s", msg.Type)
+
+			// Handle the message based on type
+			switch msg.Type {
+			case TypeLogSearch:
+				// Parse the search command
+				var searchCmd LogSearchCommand
+				if data, err := json.Marshal(msg.Payload); err == nil {
+					if err := json.Unmarshal(data, &searchCmd); err == nil {
+						log.Printf("[AGENT] Processing search command for %d files: %v",
+							len(searchCmd.Files), searchCmd.Files)
+						log.Printf("[AGENT] Search keywords: %v", searchCmd.Keywords)
+
+						a.handleSearchCommand(ctx, searchCmd)
+					} else {
+						log.Printf("[AGENT][ERROR] Failed to parse search command: %v", err)
+					}
+				} else {
+					log.Printf("[AGENT][ERROR] Failed to prepare search command: %v", err)
+				}
+
+			default:
+				log.Printf("[AGENT] Received unhandled message type: %s", msg.Type)
+			}
 		}
 	}
+}
+
+func (a *Agent) handleSearchCommand(ctx context.Context, cmd LogSearchCommand) {
+	log.Printf("[AGENT] Processing search command for %d files with %d keywords",
+		len(cmd.Files), len(cmd.Keywords))
+
+	a.activeSearches.Add(1)
+	go func() {
+		defer a.activeSearches.Done()
+
+		req := logcollect.FileProcessRequest{
+			Files:    cmd.Files,
+			Keywords: cmd.Keywords,
+		}
+
+		if err := a.logCollector.ProcessFiles(ctx, req); err != nil {
+			log.Printf("[AGENT][ERROR] File processing failed: %v", err)
+		}
+	}()
 }
 
 func (a *Agent) handleNetworkMetrics(ctx context.Context) {
@@ -160,7 +202,6 @@ func (a *Agent) handleLogs(ctx context.Context) {
 	discoverTicker := time.NewTicker(30 * time.Second)
 	defer discoverTicker.Stop()
 
-	// Send initial file list
 	if files := a.logCollector.GetDiscoveredFiles(); len(files) > 0 {
 		log.Printf("[AGENT] Sending initial file list: found %d files", len(files))
 		msg := Message{
@@ -183,9 +224,15 @@ func (a *Agent) handleLogs(ctx context.Context) {
 		case <-ctx.Done():
 			log.Printf("[AGENT] Log handler shutting down. Stats: messages=%d, bytes=%d, errors=%d",
 				stats.messagesSent, stats.bytesProcessed, stats.errorCount)
+			// Wait for any active searches to complete
+			a.activeSearches.Wait()
 			return
 
 		case logEntries := <-logChan:
+			if len(logEntries) == 0 {
+				continue
+			}
+
 			stats.messagesSent++
 			entryCount := len(logEntries)
 			log.Printf("[AGENT] Received %d log entries to send", entryCount)
@@ -220,7 +267,6 @@ func (a *Agent) handleLogs(ctx context.Context) {
 				log.Printf("[AGENT][ERROR] Failed to send file list update: %v", err)
 			}
 
-			// Log periodic stats
 			log.Printf("[AGENT] Log handler stats: messages=%d, bytes=%d, errors=%d",
 				stats.messagesSent, stats.bytesProcessed, stats.errorCount)
 		}

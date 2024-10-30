@@ -4,12 +4,14 @@ package log
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -17,30 +19,11 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-type MessageType string
-
 const (
-	TypeLogList MessageType = "log_list"
-	TypeLogData MessageType = "log_data"
+	chunkSize     = 10 * 1024 * 1024 // 10MB chunks for processing
+	batchSize     = 1000             // Number of lines to collect before sending
+	maxGoroutines = 4                // Maximum number of concurrent file processors
 )
-
-type Message struct {
-	Type    MessageType `json:"type"`
-	Payload interface{} `json:"payload"`
-}
-
-type SearchRequest struct {
-	Files    []string `json:"files"`
-	Keywords []string `json:"keywords"`
-	MaxLines int      `json:"max_lines"`
-}
-
-type LogEntry struct {
-	Timestamp time.Time `json:"timestamp"`
-	Filename  string    `json:"filename"`
-	Line      string    `json:"line"`
-	LineNum   int       `json:"line_num"`
-}
 
 type LogFile struct {
 	Path      string    `json:"path"`
@@ -49,12 +32,25 @@ type LogFile struct {
 	IsGzipped bool      `json:"is_gzipped"`
 }
 
+type LogEntry struct {
+	Filename  string    `json:"filename"`
+	Line      string    `json:"line"`
+	LineNum   int       `json:"line_num"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type FileProcessRequest struct {
+	Files    []string `json:"files"`
+	Keywords []string `json:"keywords"`
+}
+
 type Collector struct {
-	redisClient *redis.Client
-	logChan     chan []LogEntry
-	searchChan  chan SearchRequest
-	knownFiles  map[string]time.Time
-	mutex       sync.RWMutex
+	redisClient  *redis.Client
+	logChan      chan []LogEntry
+	knownFiles   map[string]LogFile // Changed to store LogFile structs
+	mutex        sync.RWMutex
+	lastUpdate   time.Time
+	updatePeriod time.Duration
 }
 
 func New(redisAddr string) (*Collector, error) {
@@ -63,7 +59,6 @@ func New(redisAddr string) (*Collector, error) {
 		DB:   0,
 	})
 
-	// Test Redis connection
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -72,93 +67,80 @@ func New(redisAddr string) (*Collector, error) {
 	}
 
 	return &Collector{
-		redisClient: rdb,
-		logChan:     make(chan []LogEntry, 100),
-		searchChan:  make(chan SearchRequest, 10),
-		knownFiles:  make(map[string]time.Time),
+		redisClient:  rdb,
+		logChan:      make(chan []LogEntry, 100),
+		knownFiles:   make(map[string]LogFile),
+		updatePeriod: 5 * time.Minute,
 	}, nil
 }
 
 func (c *Collector) Start(ctx context.Context) {
-	// Initial updatedb
-	if err := c.updateDatabase(); err != nil {
-		log.Printf("Initial updatedb failed: %v", err)
-	}
-
-	// Start file discovery
-	go c.startFileDiscovery(ctx)
-
-	// Start search handler
-	go c.handleSearches(ctx)
-}
-
-func (c *Collector) updateDatabase() error {
-	cmd := exec.Command("sudo", "updatedb")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("updatedb failed: %w", err)
-	}
-	return nil
-}
-
-func (c *Collector) startFileDiscovery(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
 	// Initial discovery
-	if files, err := c.findLogFiles(); err == nil {
-		c.storeAndSendFiles(ctx, files)
+	if err := c.updateLogFiles(ctx); err != nil {
+		log.Printf("Initial log file discovery failed: %v", err)
 	}
+
+	// Periodic discovery
+	ticker := time.NewTicker(c.updatePeriod)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := c.updateDatabase(); err != nil {
-				log.Printf("Failed to update database: %v", err)
-				continue
+			if err := c.updateLogFiles(ctx); err != nil {
+				log.Printf("Log file discovery failed: %v", err)
 			}
-
-			files, err := c.findLogFiles()
-			if err != nil {
-				log.Printf("Failed to find files: %v", err)
-				continue
-			}
-
-			c.storeAndSendFiles(ctx, files)
 		}
 	}
 }
 
-func (c *Collector) storeAndSendFiles(ctx context.Context, files []LogFile) {
-	if len(files) > 0 {
-		// Store in Redis
-		if data, err := json.Marshal(files); err == nil {
-			c.redisClient.Set(ctx, "discovered_logs", data, 24*time.Hour)
-		}
+func (c *Collector) GetDiscoveredFiles() []LogFile {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
 
-		// Update known files
-		c.mutex.Lock()
-		for _, file := range files {
-			c.knownFiles[file.Path] = file.ModTime
-		}
-		c.mutex.Unlock()
-
-		// Send through channel
-		select {
-		case c.logChan <- []LogEntry{{
-			Timestamp: time.Now(),
-			Line:      fmt.Sprintf("Found %d log files", len(files)),
-		}}:
-		default:
-			log.Printf("Channel full, couldn't send file count")
+	files := make([]LogFile, 0, len(c.knownFiles))
+	for _, file := range c.knownFiles {
+		// Verify file still exists and is accessible
+		if info, err := os.Stat(file.Path); err == nil {
+			// Update size and modtime if changed
+			file.Size = info.Size()
+			file.ModTime = info.ModTime()
+			files = append(files, file)
 		}
 	}
+	return files
+}
+
+func (c *Collector) updateLogFiles(ctx context.Context) error {
+	files, err := c.findLogFiles()
+	if err != nil {
+		return err
+	}
+
+	// Update known files
+	c.mutex.Lock()
+	for _, file := range files {
+		c.knownFiles[file.Path] = file
+	}
+	c.lastUpdate = time.Now()
+	c.mutex.Unlock()
+
+	// Compress and store the file list
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if err := json.NewEncoder(gz).Encode(files); err != nil {
+		return fmt.Errorf("failed to encode files: %w", err)
+	}
+	gz.Close()
+
+	// Store in Redis with 1 hour expiry
+	return c.redisClient.Set(ctx, "log_files", buf.Bytes(), time.Hour).Err()
 }
 
 func (c *Collector) findLogFiles() ([]LogFile, error) {
-	// Use locate command to find log files
-	cmd := exec.Command("locate", "--regex", "\\.(log|txt|gz)$")
+	cmd := exec.Command("locate", "-i", "--regex", "\\.(log|txt)$|/log/|/logs/")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("locate command failed: %w", err)
@@ -184,129 +166,127 @@ func (c *Collector) findLogFiles() ([]LogFile, error) {
 	return files, nil
 }
 
-func (c *Collector) handleSearches(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case search := <-c.searchChan:
-			go c.processSearch(ctx, search)
-		}
-	}
-}
-
-func (c *Collector) processSearch(ctx context.Context, search SearchRequest) {
+func (c *Collector) ProcessFiles(ctx context.Context, req FileProcessRequest) error {
+	semaphore := make(chan struct{}, maxGoroutines)
+	errChan := make(chan error, len(req.Files))
 	var wg sync.WaitGroup
-	for _, file := range search.Files {
+
+	for _, filePath := range req.Files {
 		wg.Add(1)
-		go func(filepath string) {
+		go func(path string) {
 			defer wg.Done()
-			c.searchFile(ctx, filepath, search.Keywords)
-		}(file)
+			semaphore <- struct{}{}        // Acquire
+			defer func() { <-semaphore }() // Release
+
+			if err := c.processFile(ctx, path, req.Keywords); err != nil {
+				errChan <- fmt.Errorf("error processing %s: %w", path, err)
+			}
+		}(filePath)
 	}
+
+	// Wait for all goroutines to finish
 	wg.Wait()
+	close(errChan)
+
+	// Collect any errors
+	var errors []string
+	for err := range errChan {
+		errors = append(errors, err.Error())
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("processing errors: %s", strings.Join(errors, "; "))
+	}
+
+	return nil
 }
 
-func (c *Collector) searchFile(ctx context.Context, filepath string, keywords []string) {
-	file, err := os.Open(filepath)
+func (c *Collector) processFile(ctx context.Context, filePath string, keywords []string) error {
+	file, err := os.Open(filePath)
 	if err != nil {
-		log.Printf("Failed to open file %s: %v", filepath, err)
-		return
+		return fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	lineNum := 0
 	var batch []LogEntry
-
-	// Use larger buffer for scanning
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	lineNum := 0
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, chunkSize), chunkSize)
 
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		default:
 			lineNum++
 			line := scanner.Text()
 
+			// Check if line contains any of the keywords
 			for _, keyword := range keywords {
 				if strings.Contains(line, keyword) {
 					batch = append(batch, LogEntry{
-						Timestamp: time.Now(),
-						Filename:  filepath,
+						Filename:  filePath,
 						Line:      line,
 						LineNum:   lineNum,
+						Timestamp: time.Now(),
 					})
 					break
 				}
 			}
 
 			// Send batch if it's full
-			if len(batch) >= 100 {
-				select {
-				case c.logChan <- batch:
-					batch = make([]LogEntry, 0, 100)
-				default:
-					log.Printf("Channel full, dropping batch for %s", filepath)
+			if len(batch) >= batchSize {
+				if err := c.sendBatch(ctx, batch); err != nil {
+					return fmt.Errorf("failed to send batch: %w", err)
 				}
+				batch = make([]LogEntry, 0, batchSize)
 			}
 		}
 	}
 
 	// Send remaining entries
 	if len(batch) > 0 {
-		select {
-		case c.logChan <- batch:
-		default:
-			log.Printf("Channel full, dropping final batch for %s", filepath)
+		if err := c.sendBatch(ctx, batch); err != nil {
+			return fmt.Errorf("failed to send final batch: %w", err)
 		}
 	}
+
+	return scanner.Err()
 }
 
-func (c *Collector) GetDiscoveredFiles() []LogFile {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-
-	files := make([]LogFile, 0, len(c.knownFiles))
-	for path, modTime := range c.knownFiles {
-		if info, err := os.Stat(path); err == nil {
-			files = append(files, LogFile{
-				Path:      path,
-				Size:      info.Size(),
-				ModTime:   modTime,
-				IsGzipped: strings.HasSuffix(path, ".gz"),
-			})
-		}
+func (c *Collector) sendBatch(ctx context.Context, entries []LogEntry) error {
+	// Compress the batch
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if err := json.NewEncoder(gz).Encode(entries); err != nil {
+		return fmt.Errorf("failed to encode entries: %w", err)
 	}
-	return files
+	gz.Close()
+
+	// Send through channel
+	select {
+	case c.logChan <- entries:
+		return nil
+	default:
+		log.Printf("Warning: Channel full, dropping batch of %d entries", len(entries))
+		return nil
+	}
 }
 
 func (c *Collector) GetLogChannel() <-chan []LogEntry {
 	return c.logChan
 }
 
-func (c *Collector) SubmitSearch(search SearchRequest) {
-	select {
-	case c.searchChan <- search:
-	default:
-		log.Printf("Search channel full, dropping search request")
-	}
-}
-
 func isLogFile(path string) bool {
-	path = strings.ToLower(path)
-	extensions := []string{".log", ".txt", ".gz"}
-	for _, ext := range extensions {
-		if strings.HasSuffix(path, ext) {
-			return true
-		}
-	}
-	return false
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".log" || ext == ".txt" || strings.Contains(path, "/log/") || strings.Contains(path, "/logs/")
 }
 
 func isReadable(path string) bool {
-	_, err := os.Open(path)
-	return err == nil
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	file.Close()
+	return true
 }

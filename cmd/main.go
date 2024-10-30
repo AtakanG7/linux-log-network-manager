@@ -25,13 +25,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Initialize agent
 	a, err := agent.New(hostAddr, redisAddr)
 	if err != nil {
 		log.Fatalf("Failed to initialize agent: %v", err)
 	}
 
-	// Handle shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
@@ -41,8 +39,7 @@ func main() {
 		cancel()
 	}()
 
-	// Run agent
 	if err := a.Run(ctx); err != nil {
-		log.Fatalf("Agent error: %v", err)
+		log.Printf("Agent error: %v", err)
 	}
 }
