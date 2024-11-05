@@ -14,7 +14,7 @@ import (
 func main() {
 	hostAddr := os.Getenv("HOST_ADDR")
 	if hostAddr == "" {
-		hostAddr = "localhost:8080"
+		hostAddr = "localhost:8081"
 	}
 
 	redisAddr := os.Getenv("REDIS_ADDR")
@@ -39,7 +39,8 @@ func main() {
 		cancel()
 	}()
 
+	// Run agent
 	if err := a.Run(ctx); err != nil {
-		log.Printf("Agent error: %v", err)
+		log.Fatalf("Agent error: %v", err)
 	}
 }

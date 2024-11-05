@@ -16,8 +16,10 @@ require (
 
 require (
 	github.com/go-ole/go-ole v1.2.6 // indirect
+	github.com/go-redis/redis v6.15.9+incompatible
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
+	github.com/shirou/gopsutil v3.21.11+incompatible
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	golang.org/x/sys v0.20.0 // indirect
 )

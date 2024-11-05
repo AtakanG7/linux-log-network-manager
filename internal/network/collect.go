@@ -301,7 +301,10 @@ func (c *Collector) processNextBatch(ctx context.Context) error {
 }
 
 func (c *Collector) startPeriodicSender(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
+	// #TODO: The periodic sender is totaly dependent on the network flow speed
+	// so it should dynamically adjust the interval based on the number of
+	// packets processed.
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -309,7 +312,6 @@ func (c *Collector) startPeriodicSender(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Get all metrics from processed queue
 			results, err := c.redisClient.LRange(ctx, processedQueue, 0, -1).Result()
 			if err != nil {
 				log.Printf("Failed to get processed metrics: %v", err)
@@ -317,12 +319,10 @@ func (c *Collector) startPeriodicSender(ctx context.Context) {
 			}
 
 			if len(results) > 0 {
-				// Clear processed queue after retrieving
 				if err := c.redisClient.Del(ctx, processedQueue).Err(); err != nil {
 					log.Printf("Failed to clear processed queue: %v", err)
 				}
-				log.Printf("Sending batch of %d processed metrics sets", len(results))
-				// Here you would send the batch to your client
+				log.Printf("Sending batch of %d processed network metrics sets", len(results))
 			}
 		}
 	}
